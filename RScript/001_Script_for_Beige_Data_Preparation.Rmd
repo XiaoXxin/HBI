@@ -1,0 +1,975 @@
+---
+title: "Script_for_Beige_Data_Preparation"
+author: "Yuxin Wang"
+output: 
+  html_document: 
+    fig_height: 10
+    fig_width: 10
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(fig.keep = "high")
+```
+
+# library
+
+```{r library}
+library(oligo)
+library(hgu133plus2.db)
+library(hugene10sttranscriptcluster.db)
+library(HsAgilentDesign026652.db)
+library(limma)
+library(GEOquery)
+library(DESeq2)
+library(sva)
+library(clusterProfiler)
+library(FactoMineR)
+library(factoextra)
+library(tidyverse)
+```
+
+# create dir
+
+```{r dir}
+
+dir.create("RScript") # for saving r script
+dir.create("rawData") # for downloading raw data
+dir.create("RData") # for saving temp data
+dir.create("plot") # for plots
+
+```
+
+
+# GSE13070
+# we downloaded the expression matrix from Gene Expression Omnibus (GEO) repository using GEOquery
+# this dataset was used to validate the performance of HBI
+
+```{r GSE13070}
+# global options
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+gse = "GSE13070"
+name = "BT3"
+
+# download data 
+Sys.setenv(VROOM_CONNECTION_SIZE = 13107200)
+eset <- getGEO("GSE13070", destdir="./rawData/GSE13070", AnnotGPL = F, getGPL = F)
+eset <- eset[[1]]
+phenoData <- pData(eset)
+eset <- exprs(eset)
+
+# prepare sample annotations
+phenoData <- data.frame(sample = phenoData$geo_accession, 
+                        treat = phenoData$`tzd treatment:ch1`,
+                        tissue = phenoData$`tissue:ch1`,
+                        subject = phenoData$`subject:ch1`,
+                        response = phenoData$`response to tzd treatment:ch1`,
+                        IR = phenoData$`insulin resistance:ch1`,
+                        clamp = phenoData$`clamp status:ch1`)
+phenoData <- phenoData[phenoData$tissue == "adipose",]
+phenoData <- phenoData[!grepl("non responder", phenoData$response),]
+phenoData$group <- ifelse(phenoData$treat == "preTZD", "WAT", "BAT")
+eset <- eset[,phenoData$sample]
+
+# prepare gene annotations
+IDs <- toTable(hgu133plus2SYMBOL)
+
+# remove duplicated genes
+dim(eset)
+eset <- eset[rownames(eset) %in% IDs$probe_id, ]
+dim(eset)
+IDs <- IDs[match(rownames(eset), IDs$probe_id), ]
+eset <- avereps(eset, ID = IDs$symbol)
+dim(eset)
+
+# batch effects
+# only the batch disturbing the biological difference (white/brown) will be removed
+dat <- as.data.frame(t(eset))
+pca <- PCA(dat, graph = FALSE)
+
+fviz_pca_ind(pca, 
+             label = "none",
+             axes = c(1,2),
+             title = "BT3",
+             pointsize = 2.5,
+             pointshape = 19,
+             addEllipses = F,
+             mean.point = FALSE,
+             habillage = as.factor(phenoData$group))+
+  theme(plot.title = element_text(hjust = 0.5))+xlim(-100,100)
+
+mod <- model.matrix(~as.factor(group), data = phenoData)
+eset_batch <- ComBat(dat = eset, batch = phenoData$subject, mod = mod)
+
+dat <- as.data.frame(t(eset_batch))
+pca <- PCA(dat, graph = FALSE)
+
+fviz_pca_ind(pca, 
+             label = "none",
+             axes = c(1,2),
+             title = "BT3",
+             pointsize = 2.5,
+             pointshape = 19,
+             addEllipses = F,
+             mean.point = FALSE,
+             habillage = as.factor(phenoData$group))+
+  theme(plot.title = element_text(hjust = 0.5))+xlim(-100,100)
+
+resList <- list(expMatrix = eset_batch, phenoData = phenoData, IDs = IDs, dif = NA, gse = gse, name = name)
+assign(paste0("res_", name, "_",gse), resList)
+save(list = paste0("res_", name, "_",gse), file = paste0("./RData/result_", name, "_", gse, ".RData"))
+
+# isolate IR samples for meta analysis
+keep1 <- grep("IRd",phenoData$IR)
+eset_k1 <- eset_batch[,keep1]
+colnames(eset_k1) <- paste0(colnames(eset_k1), "_", "IR")
+phenoData_k1 <- phenoData[keep1,]
+phenoData_k1$sample <- paste0(phenoData_k1$sample, "_", "IR")
+
+res_BT3_GSE13070_IR <- list(expMatrix = eset_k1, phenoData = phenoData_k1, IDs = IDs, dif = NA, gse = "GSE13070_IR", name = "BT3_IR")
+save(res_BT3_GSE13070_IR, file = "./RData/result_BT3_GSE13070_IR.RData")
+
+# isolate IS samples for meta analysis
+keep2 <- grep("NRd",phenoData$IR)
+eset_k2 <- eset_batch[,keep2]
+colnames(eset_k2) <- paste0(colnames(eset_k2), "_", "IS")
+phenoData_k2 <- phenoData[keep2,]
+phenoData_k2$sample <- paste0(phenoData_k2$sample, "_", "IS")
+
+res_BT3_GSE13070_IS <- list(expMatrix = eset_k2, phenoData = phenoData_k2, IDs = IDs, dif = NA, gse = "GSE13070_IS", name = "BT3_IS")
+save(res_BT3_GSE13070_IS, file = "./RData/result_BT3_GSE13070_IS.RData")
+
+```
+
+# GSE54280
+# we downloaded the raw data from Gene Expression Omnibus (GEO) repository
+# this dataset was used to validate the performance of HBI
+
+```{r GSE54280}
+# global options
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+gse = "GSE54280"
+name = "BP1"
+
+# load raw data
+celFiles <-  list.files(path = "./rawData/GSE54280", pattern = "\\.gz$", full.names = T)
+rawData <- oligo::read.celfiles(celFiles)
+
+# rename
+sampleNames(rawData)
+sampleNames(rawData) <- gsub("_.*", "", sampleNames(rawData))
+sampleNames(rawData)
+
+# call rma function
+rawData.rma <- oligo::rma(rawData)
+
+# isolate matrix
+eset <- exprs(rawData.rma)
+
+# prepare sample annotations
+phenoData <- data.frame(sample = colnames(eset), 
+                        group = rep(c("Deep neck progenitors", "Subcutaneous progenitors"), 6),
+                        batch = rep(c("P1","P2","P3","P4","P5","P6"),each = 2))
+
+# prepare gene annotations
+library(hugene10sttranscriptcluster.db)
+IDs <- toTable(hugene10sttranscriptclusterSYMBOL)
+
+# remove duplicated genes
+dim(eset)
+eset <- eset[rownames(eset) %in% IDs$probe_id, ]
+dim(eset)
+IDs <- IDs[match(rownames(eset), IDs$probe_id), ]
+eset <- avereps(eset, ID = IDs$symbol)
+dim(eset)
+
+# remove batch effects
+# only the batch disturbing the biological difference (white/brown) will be removed
+dat <- as.data.frame(t(eset))
+pca <- PCA(dat, graph = FALSE)
+
+fviz_pca_ind(pca, 
+             label = "none", 
+             title = "",
+             pointsize = 2.5,
+             pointshape = 19,
+             addEllipses = T, 
+             ellipse.level = 0.95, 
+             mean.point = FALSE,
+             habillage = as.factor(phenoData$group))
+
+mod <- model.matrix(~as.factor(group), data = phenoData)
+eset_batch <- ComBat(dat = eset, batch = phenoData$batch, mod = mod)
+
+eset_batch <- ComBat(dat = eset, batch = phenoData$batch)
+
+dat <- as.data.frame(t(eset_batch))
+pca <- PCA(dat, graph = FALSE)
+
+fviz_pca_ind(pca, 
+             label = "none", 
+             title = "",
+             pointsize = 2.5,
+             pointshape = 19,
+             addEllipses = T, 
+             ellipse.level = 0.95, 
+             mean.point = FALSE,
+             habillage = as.factor(phenoData$group))
+
+resList <- list(expMatrix = eset_batch, phenoData = phenoData, IDs = IDs, dif = NA, gse = gse, name = name)
+
+assign(paste0("res_", name, "_",gse), resList)
+
+save(list = paste0("res_", name, "_",gse), file = paste0("./RData/result_", name, "_", gse, ".RData"))
+
+```
+
+# GSE56633
+# we downloaded raw data from Gene Expression Omnibus (GEO) repository
+# this dataset was used to identify the signature genes of human adipose browning 
+
+```{r GSE56633}
+# global options
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+gse = "GSE56633"
+name = "BC1"
+
+# load raw data
+celFiles <-  list.files(path = "./rawData/GSE56633", pattern = "\\.gz$", full.names = T)
+rawData <- read.celfiles(celFiles)
+
+# rename
+sampleNames(rawData)
+sampleNames(rawData) <- gsub("_.*", "", sampleNames(rawData))
+sampleNames(rawData)
+
+# call rma function
+rawData.rma <- oligo::rma(rawData)
+
+# isolate matrix
+eset <- exprs(rawData.rma)
+
+# prepare sample annotations
+phenoData <- data.frame(sample = colnames(eset), group = c("White", "Beige", "Beige", "Beige", "Beige", "Beige"))
+
+# prepare gene annotations
+IDs <- toTable(hugene10sttranscriptclusterSYMBOL)
+
+# remove duplicated genes
+dim(eset)
+eset <- eset[rownames(eset) %in% IDs$probe_id, ]
+dim(eset)
+IDs <- IDs[match(rownames(eset), IDs$probe_id), ]
+eset <- avereps(eset, ID = IDs$symbol)
+dim(eset)
+
+# batch effects
+# only the batch disturbing the biological difference (white/brown) will be removed
+dat <- as.data.frame(t(eset))
+pca <- PCA(dat, graph = FALSE)
+
+sp <- fviz_pca_ind(pca, 
+             label = "none", 
+             title = "BC1",
+             pointsize = 2.5,
+             pointshape = 19,
+             addEllipses = F, 
+             mean.point = FALSE,
+             habillage = as.factor(phenoData$group))+
+  theme(plot.title = element_text(hjust = 0.5))+
+  xlim(-200, 100)+ylim(-200,200)
+
+pdf(file = "./plot/pca_bc1.pdf", width = 5, height = 4)
+sp
+dev.off()
+
+# DEGs analysis
+group <- factor(phenoData[,"group"])
+
+design <- model.matrix(~0+group)
+colnames(design) <- gsub("group", "", colnames(design))
+
+contrast.matrix <- makeContrasts(contrasts = c("Beige-White"), levels = design)
+
+fit <- lmFit(eset, design) %>% contrasts.fit(contrast.matrix) %>% eBayes()
+
+dif <- topTable(fit, coef = c("Beige-White"), n = nrow(fit))
+
+dif$symbol <- rownames(dif)
+
+dif$cohort <- gse
+
+resList <- list(expMatrix = eset, phenoData = phenoData, IDs = IDs, dif = dif, gse = gse, name = name)
+
+assign(paste0("res_", name, "_",gse), resList)
+
+save(list = paste0("res_", name, "_",gse), file = paste0("./RData/result_", name, "_", gse, ".RData"))
+
+```
+
+# GSE57896
+# we downloaded raw counts data from Gene Expression Omnibus (GEO) repository
+# this dataset was used to identify the signature genes of human adipose browning 
+
+```{r GSE57896}
+# global options
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+gse = "GSE57896"
+name = "BC2"
+
+# load data
+counts <- read.table("./rawData/GSE57896/GSE57896_adipose_browning_counts.txt.gz", 
+                      sep = '\t', quote = "", dec = ",", fill = T, header = T, encoding='UTF-8')
+
+# remove duplicated genes
+IDs <- bitr(counts$EntrezGeneID, fromType = "ENTREZID", toType = "SYMBOL", OrgDb = "org.Hs.eg.db")
+
+dim(counts)
+counts <- counts[counts$EntrezGeneID %in% IDs$ENTREZID,]
+dim(counts)
+
+IDs <- IDs[match(counts$EntrezGeneID,IDs$ENTREZID), ]
+
+rownames(counts) <- IDs$SYMBOL
+counts <- counts[,-1]
+counts <- as.matrix(counts)
+
+# download smaple annotation informations
+getPhenoData <- function(GSE){
+  require(GEOquery)
+  require(tidyverse)
+  getGEOfile(GSE, destdir = ".")
+  eset <- getGEO(filename = paste0(GSE, ".soft.gz"))
+  eset <- eset@gsms
+  
+  file.remove(paste0(GSE, ".soft.gz"))
+  
+  phenoData <- data.frame()
+  
+  for (i in 1:length(eset)) {
+    gsm <- eset[[i]] %>% .@header 
+    gsm <- c(gsm$title, gsm$characteristics_ch1)
+    phenoData <- rbind(phenoData, gsm)
+  }
+  colnames(phenoData) <- c("sample", "type", "treatment", "time", "replicate", "batch", "lane", "multiplex")
+  
+  phenoData
+}
+
+phenoData <- getPhenoData(GSE = "GSE57896")
+
+phenoData$type <- gsub("cell type: ", "", phenoData$type)
+phenoData$treatment <- gsub("treatment: ", "", phenoData$treatment)
+phenoData$batch <- gsub("librarybatch: ", "", phenoData$batch)
+
+# isolate white and beige samples
+phenoData <- phenoData[phenoData$type %in% c("WAT", "BAT"),]
+phenoData <- phenoData[phenoData$treatment == "DMSO",]
+
+counts <- counts[, phenoData$sample]
+
+group <- phenoData[,c("type", "batch")]
+
+dds <- DESeqDataSetFromMatrix(counts, 
+                              colData = group, 
+                              design = ~ batch + type)
+
+
+dim(dds)
+cps <- fpm(dds)
+keep1 <- rowSums(cps >= 1) >= ceiling(ncol(dds)*3/4)
+dds <- dds[keep1, ]
+dim(dds)
+
+dds <- DESeq(dds)
+
+# get DEGs
+res <- results(dds, contrast = c("type", "BAT", "WAT"))
+
+dif <- as.data.frame(res) %>% na.omit()
+dif$symbol <- rownames(dif)
+dif$cohort <- gse
+
+# normalize counts
+exprSet <- rlogTransformation(dds, blind = FALSE) %>% assay()
+
+# batch effects (no batch effects need to be removed)
+# only the batch disturbing the biological difference (white/brown) will be removed
+dat <- as.data.frame(t(exprSet))
+pca <- PCA(dat, graph = FALSE)
+
+phenoData$group <- ifelse(phenoData$type == "WAT", "White", "Beige")
+sp <- fviz_pca_ind(pca, 
+                   label = "none", 
+                   title = "BC2",
+                   pointsize = 2.5,
+                   pointshape = 19,
+                   addEllipses = F, 
+                   mean.point = FALSE,
+                   habillage = as.factor(phenoData$group))+
+  theme(plot.title = element_text(hjust = 0.5))+ylim(-200,200)
+
+pdf(file = "./plot/pca_bc2.pdf", width = 5, height = 4)
+sp
+dev.off()
+
+resList <- list(expMatrix = exprSet, phenoData = phenoData, IDs = IDs, dif = dif, gse = gse, name = name)
+assign(paste0("res_", name, "_",gse), resList)
+save(list = paste0("res_", name, "_",gse), file = paste0("./RData/result_", name, "_", gse, ".RData"))
+
+# isolate batch A samples for meta analysis
+keep1 <- 1:6
+exprSet_k1 <- exprSet[,keep1]
+colnames(exprSet_k1) <- paste0(colnames(exprSet_k1), "_", "A")
+phenoData_k1 <- phenoData[keep1,]
+phenoData_k1$sample <- paste0(phenoData_k1$sample, "_", "A")
+
+res_BC2_GSE57896_A <- list(expMatrix = exprSet_k1, phenoData = phenoData_k1, IDs = IDs, dif = NA, gse = "GSE57896_A", name = "BC2_A")
+save(res_BC2_GSE57896_A, file = "./RData/result_BC2_GSE57896_A.RData")
+
+# isolate batch B samples for meta analysis
+keep2 <- c(7:12)
+exprSet_k2 <- exprSet[,keep2]
+colnames(exprSet_k2) <- paste0(colnames(exprSet_k2), "_", "B")
+phenoData_k2 <- phenoData[keep2,]
+phenoData_k2$sample <- paste0(phenoData_k2$sample, "_", "B")
+
+res_BC2_GSE57896_B <- list(expMatrix = exprSet_k2, phenoData = phenoData_k2, IDs = IDs, dif = NA, gse = "GSE57896_B", name = "BC2_B")
+save(res_BC2_GSE57896_B, file = "./RData/result_BC2_GSE57896_B.RData")
+
+```
+
+# GSE71293
+# we downloaded the data from Gene Expression Omnibus (GEO) repository using GEOquery
+# this dataset was used to identify the signature genes of human adipose browning 
+
+```{r GSE71293}
+# global options
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+gse = "GSE71293"
+name = "BC3"
+
+# download data
+eset <- getGEO("GSE71293", destdir="./rawData/GSE71293", AnnotGPL = F, getGPL = F)
+eset <- eset[[1]]
+phenoData <- pData(eset)
+eset <- exprs(eset)
+eset[is.na(eset)] = 0
+
+dim(eset)
+keep1 <- apply(eset, 1, function(x) sum(is.na(x))) <= 6
+eset <- eset[keep1,]
+dim(eset)
+
+# prepare sample annotations
+phenoData <- data.frame(sample = phenoData$geo_accession, treat = phenoData$title, group = phenoData$title)
+
+phenoData$treat <- gsub("Control.*", "Control", phenoData$treat)
+phenoData$treat <- gsub("Rosiglitazone.*", "Rosi", phenoData$treat)
+phenoData$treat <- gsub("GW7647.*", "GW7647", phenoData$treat)
+
+phenoData$group <- gsub("Control.*", "White", phenoData$group)
+phenoData$group <- gsub("Rosiglitazone.*", "Beige", phenoData$group)
+phenoData$group <- gsub("GW7647.*", "Beige", phenoData$group)
+
+# prepare gene annotations
+IDs <- toTable(HsAgilentDesign026652SYMBOL)
+
+# remove duplicated genes
+dim(eset)
+eset <- eset[rownames(eset) %in% IDs$probe_id, ]
+dim(eset)
+IDs <- IDs[match(rownames(eset), IDs$probe_id), ]
+eset <- avereps(eset, ID = IDs$symbol)
+dim(eset)
+
+# batch effects (no batch need to be removed)
+# only the batch disturbing the biological difference (white/brown) will be removed
+dat <- as.data.frame(t(eset))
+pca <- PCA(dat, graph = FALSE)
+
+sp <- fviz_pca_ind(pca, 
+                   label = "none", 
+                   axes = c(2,3),
+                   title = "BC3",
+                   pointsize = 2.5,
+                   pointshape = 19,
+                   addEllipses = F,
+                   mean.point = FALSE,
+                   habillage = as.factor(phenoData$group))+
+  theme(plot.title = element_text(hjust = 0.5))+xlim(-100,100)
+
+pdf(file = "./plot/pca_bc3.pdf", width = 5, height = 4)
+sp
+dev.off()
+
+# DEGs analysis
+group <- factor(phenoData[,"group"])
+
+design <- model.matrix(~0+group)
+colnames(design) <- gsub("group", "", colnames(design))
+
+contrast.matrix <- makeContrasts(contrasts = c("Beige-White"), levels = design)
+
+fit <- lmFit(eset, design) %>% contrasts.fit(contrast.matrix) %>% eBayes()
+
+dif <- topTable(fit, coef = c("Beige-White"), n = nrow(fit))
+
+dif$symbol <- rownames(dif)
+
+dif$cohort <- gse
+
+resList <- list(expMatrix = eset, phenoData = phenoData, IDs = IDs, dif = dif, gse = gse, name = name)
+assign(paste0("res_", name, "_",gse), resList)
+save(list = paste0("res_", name, "_",gse), file = paste0("./RData/result_", name, "_", gse, ".RData"))
+
+# isolate Rosi samples for meta analysis
+keep1 <- 1:8
+eset_k1 <- eset[,keep1]
+colnames(eset_k1) <- paste0(colnames(eset_k1), "_", "Rosi")
+phenoData_k1 <- phenoData[keep1,]
+phenoData_k1$sample <- paste0(phenoData_k1$sample, "_", "Rosi")
+
+res_BC3_GSE71293_Rosi <- list(expMatrix = eset_k1, phenoData = phenoData_k1, IDs = IDs, dif = NA, gse = "GSE71293_Rosi", name = "BC3_Rosi")
+save(res_BC3_GSE71293_Rosi, file = "./RData/result_BC3_GSE71293_Rosi.RData")
+
+# isolate GW7647 samples for meta analysis
+keep2 <- c(1:4, 9:12)
+eset_k2 <- eset[,keep2]
+colnames(eset_k2) <- paste0(colnames(eset_k2), "_", "GW7647")
+phenoData_k2 <- phenoData[keep2,]
+phenoData_k2$sample <- paste0(phenoData_k2$sample, "_", "GW7647")
+
+res_BC3_GSE71293_GW7647 <- list(expMatrix = eset_k2, phenoData = phenoData_k2, IDs = IDs, dif = NA, gse = "GSE71293_GW7647", name = "BC3_GW7647")
+save(res_BC3_GSE71293_GW7647, file = "./RData/result_BC3_GSE71293_GW7647.RData")
+
+```
+
+# GSE113764
+# we downloaded the raw data from Gene Expression Omnibus (GEO) repository
+# this dataset was used to identify the signature genes of human adipose browning 
+
+```{r GSE113764}
+# global options
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+gse = "GSE113764"
+name = "BT1"
+
+# load data
+rawData <- read.table("./rawData/GSE113764/GSE113764_humanBATWAT.txt.gz", 
+                      sep = '\t', quote = "", dec = ",", fill = T, header = T, check.names = F)
+rawData <- rawData[which(rawData$GeneId > 0),]
+
+# filter low-expressed genes
+dim(rawData)
+keep <- rowSums(rawData[,4:ncol(rawData)] >=1 ) >= 15
+rawData <- rawData[keep, ]
+dim(rawData)
+
+# remove duplicated genes
+rpkm <- avereps(rawData[, 4:ncol(rawData)], ID = rawData$Symbol)
+
+# trans to TPM
+fpkmToTpm <- function(fpkm)
+{
+  exp(log(fpkm) - log(sum(fpkm)) + log(1e6))
+}
+
+tpm <- apply(rpkm, 2, fpkmToTpm)
+
+# download smaple annotation informations
+getPhenoData <- function(GSE){
+  require(GEOquery)
+  require(tidyverse)
+  getGEOfile(GSE, destdir = ".")
+  eset <- getGEO(filename = paste0(GSE, ".soft.gz"))
+  eset <- eset@gsms
+  
+  file.remove(paste0(GSE, ".soft.gz"))
+  
+  phenoData <- data.frame()
+  
+  for (i in 1:length(eset)) {
+    gsm <- eset[[i]] %>% .@header 
+    gsm <- c(gsm$geo_accession, gsm$characteristics_ch1, gsm$title)
+    phenoData <- rbind(phenoData, gsm)
+  }
+  colnames(phenoData) <- c("sample", "individual", "tissue", "group", "indiGroup")
+  
+  phenoData
+}
+
+phenoData <- getPhenoData(GSE = "GSE113764")
+phenoData$tissue <- gsub("tissue: ", "", phenoData$tissue)
+phenoData$group <- gsub("18fdg-pet-ct: BAT ", "", phenoData$group)
+phenoData$iden <- ifelse(phenoData$tissue == "BAT" & phenoData$group == "positive", "BAT", "WAT")
+phenoData$group <- phenoData$iden
+
+colnames(tpm) <- gsub("P\xe4o", "Pao", colnames(tpm))
+tpm <- tpm[, phenoData$indiGroup]
+
+# batch effects
+# only the batch disturbing the biological difference (white/brown) will be removed
+dat <- as.data.frame(t(log2(tpm+1)))
+pca <- PCA(dat, graph = FALSE)
+
+sp <- fviz_pca_ind(pca, 
+             label = "none", 
+             axes = c(2,4),
+             title = "BT1",
+             pointsize = 2.5,
+             pointshape = 19,
+             addEllipses = F, 
+             mean.point = FALSE,
+             habillage = as.factor(phenoData$iden))+
+  theme(plot.title = element_text(hjust = 0.5))
+
+pdf(file = "./plot/pca_bt1.pdf", width = 5, height = 4)
+sp
+dev.off()
+
+# DEGs analysis
+group <- factor(phenoData[,"iden"])
+
+design <- model.matrix(~0+group)
+colnames(design) <- gsub("group", "", colnames(design))
+
+contrast.matrix <- makeContrasts(contrasts = c("BAT-WAT"), levels = design)
+
+ltpm <- log2(tpm+1)
+
+fit <- lmFit(ltpm, design) %>% contrasts.fit(contrast.matrix) %>% eBayes()
+
+dif <- topTable(fit, coef = c("BAT-WAT"), n = nrow(fit))
+
+dif$symbol <- rownames(dif)
+
+dif$cohort <- gse
+
+resList <- list(expMatrix = ltpm, phenoData = phenoData, IDs = NA, dif = dif, gse = gse, name = name)
+
+assign(paste0("res_", name, "_",gse), resList)
+
+save(list = paste0("res_", name, "_",gse), file = paste0("./RData/result_", name, "_", gse, ".RData"))
+
+```
+
+# GSE115421
+# we downloaded the fastq file from EBI >>> HISAT2 >>> featurecounts
+# this dataset was used to validate the performance of HBI
+
+```{r GSE115421}
+# global options
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+gse = "GSE115421"
+name = "BC5"
+
+# load data
+counts <- read.table("./rawData/GSE115421/counts.txt", 
+                      sep = '\t', quote = "", fill = T, header = T, encoding='UTF-8')
+
+colnames(counts) <- gsub(".*align.", "", colnames(counts))
+colnames(counts) <- gsub(".sort.*", "", colnames(counts))
+
+phenoData <- read.table("./rawData/GSE115421/phenoData.txt", 
+                      sep = '\t', quote = "", fill = T, header = T, encoding='UTF-8')
+phenoData <- phenoData[1:30,]
+
+phenoData <- data.frame(sample = phenoData$run_accession,
+                        ID = str_split(phenoData$sample_title, pattern = "_", simplify = T)[,1],
+                        treat = str_split(phenoData$sample_title, pattern = "_", simplify = T)[,3])
+
+phenoData$group <- ifelse(phenoData$treat == "DMSO", "White", "Beige")
+
+IDs <- bitr(counts$Geneid, fromType = "ENSEMBL", toType = "SYMBOL", OrgDb = "org.Hs.eg.db")
+
+# remove duplicated genes
+rownames(counts) <- counts$Geneid
+counts <- counts[,-1]
+counts <- as.matrix(counts)
+counts <- counts[rownames(counts) %in% IDs$ENSEMBL,]
+IDs <- IDs[match(rownames(counts), IDs$ENSEMBL),]
+
+dim(counts)
+keep <- by(counts, IDs$SYMBOL, function(x) rownames(x)[which.max(rowMeans(x))]) %>% as.character()
+counts <- counts[keep, ]
+dim(counts)
+
+counts <- counts[, phenoData$sample]
+
+group <- phenoData[,c("group", "ID")]
+
+dds <- DESeqDataSetFromMatrix(counts, 
+                              colData = group, 
+                              design = ~ ID + group)
+
+
+dim(dds)
+cps <- fpm(dds)
+keep1 <- rowSums(cps >= 1) >= 3
+dds <- dds[keep1, ]
+dim(dds)
+
+dds <- DESeq(dds)
+
+# normalize counts
+exprSet <- vst(dds, blind = FALSE) %>% assay()
+rownames(exprSet) <- IDs$SYMBOL[match(rownames(exprSet), IDs$ENSEMBL)]
+
+# batch effects (no batch effects need to be removed)
+# only the batch disturbing the biological difference (white/brown) will be removed
+dat <- as.data.frame(t(exprSet))
+pca <- PCA(dat, graph = FALSE)
+
+fviz_pca_ind(pca, 
+             label = "none",
+             axes = c(1,2),
+             title = "BC5",
+             pointsize = 2.5,
+             pointshape = 19,
+             addEllipses = F,
+             mean.point = FALSE,
+             habillage = as.factor(phenoData$ID))+
+  theme(plot.title = element_text(hjust = 0.5))+xlim(-100,100)
+
+mod <- model.matrix(~as.factor(group), data = phenoData)
+exprSet_batch <- ComBat(dat = exprSet, batch = phenoData$ID, mod = mod)
+
+dat <- as.data.frame(t(exprSet_batch))
+pca <- PCA(dat, graph = FALSE)
+
+fviz_pca_ind(pca, 
+             label = "none",
+             axes = c(1,2),
+             title = "BT3",
+             pointsize = 2.5,
+             pointshape = 19,
+             addEllipses = F,
+             mean.point = FALSE,
+             habillage = as.factor(phenoData$group))+
+  theme(plot.title = element_text(hjust = 0.5))+xlim(-100,100)
+
+resList <- list(expMatrix = exprSet_batch, phenoData = phenoData, IDs = NA, dif = NA, gse = gse, name = name)
+
+assign(paste0("res_", name, "_",gse), resList)
+
+save(list = paste0("res_", name, "_",gse), file = paste0("./RData/result_", name, "_", gse, ".RData"))
+
+```
+
+# GSE122721
+# we downloaded the raw data from Gene Expression Omnibus (GEO) repository
+# this dataset was used to identify the signature genes of human adipose browning 
+
+```{r GSE122721}
+# global options
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+gse = "GSE122721"
+name = "BT2"
+
+# load raw data
+celFiles <-  list.files(path = "./rawData/GSE122721", pattern = "\\.gz$", full.names = T)
+rawData <- read.celfiles(celFiles)
+
+# rename
+sampleNames(rawData)
+sampleNames(rawData) <- gsub("_.*", "", sampleNames(rawData))
+sampleNames(rawData)
+
+# call rma function
+rawData.rma <- oligo::rma(rawData)
+
+# isolate matrix
+eset <- exprs(rawData.rma)
+
+# prepare sample annotations
+phenoData <- data.frame(sample = colnames(eset), 
+                        group = rep(c("WAT", "BAT"), 3),
+                        batch = c(rep("D983", 4), rep("D136", 2)))
+
+# prepare gene annotations
+IDs <- toTable(hugene10sttranscriptclusterSYMBOL)
+
+# remove duplicated genes
+dim(eset)
+eset <- eset[rownames(eset) %in% IDs$probe_id, ]
+dim(eset)
+IDs <- IDs[match(rownames(eset), IDs$probe_id), ]
+eset <- avereps(eset, ID = IDs$symbol)
+dim(eset)
+
+# batch effects
+# only the batch disturbing the biological difference (white/brown) will be removed
+dat <- as.data.frame(t(eset))
+pca <- PCA(dat, graph = FALSE)
+
+sp <- fviz_pca_ind(pca, 
+             label = "none", 
+             axes = c(1,2),
+             title = "BT2",
+             pointsize = 2.5,
+             pointshape = 19,
+             addEllipses = F, 
+             mean.point = FALSE,
+             habillage = as.factor(phenoData$group))+
+  theme(plot.title = element_text(hjust = 0.5))
+
+pdf(file = "./plot/pca_bt2.pdf", width = 5, height = 4)
+sp
+dev.off()
+
+# DEGs analysis
+group <- factor(phenoData[,"group"])
+
+design <- model.matrix(~0+group)
+colnames(design) <- gsub("group", "", colnames(design))
+
+contrast.matrix <- makeContrasts(contrasts = c("BAT-WAT"), levels = design)
+
+fit <- lmFit(eset, design) %>% contrasts.fit(contrast.matrix) %>% eBayes()
+
+dif <- topTable(fit, coef = c("BAT-WAT"), n = nrow(fit))
+
+dif$symbol <- rownames(dif)
+
+dif$cohort <- gse
+
+resList <- list(expMatrix = eset, phenoData = phenoData, IDs = IDs, dif = dif, gse = gse, name = name)
+
+assign(paste0("res_", name, "_",gse), resList)
+
+save(list = paste0("res_", name, "_",gse), file = paste0("./RData/result_", name, "_", gse, ".RData"))
+
+```
+
+# GSE125331
+# we downloaded the raw counts data from Gene Expression Omnibus (GEO) repository
+# this dataset was used to identify the signature genes of human adipose browning 
+
+```{r GSE125331}
+# global options
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+gse = "GSE125331"
+name = "BC4"
+
+# load data
+readRawCounts <- function(path){
+  require(stringr)
+  
+  file <- list.files(path = path, pattern = "\\.txt.gz$", full.names = T)
+  
+  file.short <- list.files(path = path, pattern = "\\.txt.gz$", full.names = F)
+  name <- str_split(file.short, pattern = "_", simplify = T)[,1]
+
+  
+  pb <- txtProgressBar(0, length(file), style = 3)
+  for (i in 1:length(file)) {
+    a <- file[i]
+    rawCounts <- read.table(file = a, sep = '\t', quote = "", fill = T)
+    colnames(rawCounts) <- c("geneID", name[i])
+    if(i > 1) {
+      counts <- merge(counts, rawCounts, by = "geneID") 
+    } else {
+      counts <- rawCounts
+    }
+    setTxtProgressBar(pb, i)
+  }
+  close(pb)
+
+  rownames(counts) <- counts$geneID
+  
+  counts <- counts[,-1]
+  counts <- apply(counts, c(1,2), as.numeric)
+  counts
+}
+
+counts <- readRawCounts(path = "./rawData/GSE125331")
+
+# get sample annotation informations
+file.short <- list.files(path = "./rawData/GSE125331", pattern = "\\.txt.gz$", full.names = F)
+
+phenoData <- str_split(file.short, pattern = "_", simplify = T)[,1:2] %>% magrittr::set_colnames(c("sample", "group")) %>% as.data.frame()
+
+phenoData <- phenoData[phenoData$group %in% c("Beige", "White"), ]
+
+# isolate counts
+counts <- counts[, phenoData$sample]
+
+# run DESeq2
+colData <- phenoData[,c("sample","group")]
+
+dds <- DESeqDataSetFromMatrix(counts, 
+                              colData = colData, 
+                              design = ~ group)
+# filter low-expressed genes
+dim(dds)
+cps <- fpm(dds)
+keep1 <- rowSums(cps >= 1) >= ceiling(ncol(dds)*3/4)
+dds <- dds[keep1, ]
+dim(dds)
+
+# call DESeq function
+dds <- DESeq(dds)
+
+# normalize counts
+exprSet <- rlogTransformation(dds, blind = FALSE) %>% assay()
+
+# batch effects (no batch need to be removed)
+# only the batch disturbing the biological difference (white/brown) will be removed
+dat <- as.data.frame(t(exprSet))
+pca <- PCA(dat, graph = FALSE)
+
+sp <- fviz_pca_ind(pca, 
+                   label = "none", 
+                   axes = c(1,2),
+                   title = "BC4",
+                   pointsize = 2.5,
+                   pointshape = 19,
+                   addEllipses = F,
+                   mean.point = FALSE,
+                   habillage = as.factor(phenoData$group))+
+  theme(plot.title = element_text(hjust = 0.5))+
+  xlim(-150, 100)+ylim(-150,150)
+
+pdf(file = "./plot/pca_bc4.pdf", width = 5, height = 4)
+sp
+dev.off()
+
+# get DEGs
+res <- results(dds, contrast = c("group", "Beige", "White"))
+
+dif <- as.data.frame(res) %>% na.omit()
+
+dif$symbol <- rownames(dif)
+
+dif$cohort <- gse
+
+resList <- list(expMatrix = exprSet, phenoData = phenoData, IDs = NA, dif = dif, gse = gse, name = name)
+
+assign(paste0("res_", name, "_",gse), resList)
+
+save(list = paste0("res_", name, "_",gse), file = paste0("./RData/result_", name, "_", gse, ".RData"))
+
+```
+

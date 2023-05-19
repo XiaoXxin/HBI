@@ -1,0 +1,840 @@
+---
+title: "Script_for_Machine_Learning"
+author: "Yuxin Wang"
+output: 
+  html_document: 
+    fig_height: 10
+    fig_width: 10
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(fig.keep = "high")
+```
+
+# library
+
+```{r library}
+library(DESeq2)
+library(GSVA)
+library(GSEABase)
+library(org.Hs.eg.db)
+library(dorothea)
+library(bcellViper)
+library(ggplot2)
+library(ggpubr)
+library(paletteer)
+library(patchwork)
+library(pheatmap)
+library(ComplexHeatmap)
+library(paletteer)
+library(circlize)
+library(caret)
+library(caretEnsemble)
+library(glmnet)
+library(Boruta)
+library(GEOquery)
+library(limma)
+library(oligo)
+library(FactoMineR)
+library(factoextra)
+library(sva)
+library(tidyverse)
+```
+
+# data preparation
+
+```{r}
+# global options
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+# load data
+load("./RData/cohort_GTEx_AT.RData")
+
+# isolate SAT samples
+phenoData <- phenoData[phenoData$group == "SAT",]
+counts <- counts[,phenoData$sample]
+
+# DESeq
+colData <- phenoData[,c("sample","tissue")]
+
+dds <- DESeqDataSetFromMatrix(counts, 
+                              colData = colData, 
+                              design = ~ 1)
+
+dds <- DESeq(dds)
+exprSet <- vst(dds) %>% assay()
+rownames(exprSet) <- gtf$gene_name[match(rownames(exprSet),gtf$gene_id)]
+
+save(dds, exprSet, phenoData, gtf, file = "./RData/result_GTEx_SAT.RData")
+
+```
+
+# estimate fatty acid metabolism
+
+```{r}
+# global options
+rm(list = ls())
+
+# load data
+load("./RData/result_GTEx_SAT.RData")
+
+# isolate KEGG term for ssGSEA
+buildGseaList <- function(species, selected) {
+  require(clusterProfiler)
+  require(tidyverse)
+  
+  keggList <- download_KEGG(species = species)
+  
+  keggRef <- keggList$KEGGPATHID2NAME %>% filter(to %in% selected)
+  
+  keggPath <- keggList$KEGGPATHID2EXTID %>% filter(from %in% keggRef$from)
+  
+  keggPath$from <- keggRef$to[match(keggPath$from, keggRef$from)]
+  
+  keggPath <- split(keggPath$to, keggPath$from)
+  
+  keggPath
+  
+}
+
+geneList <- buildGseaList(species = "hsa", 
+                          selected = c("Fatty acid biosynthesis", 
+                                       "Fatty acid degradation"))
+
+# rename gene names
+IDs <- bitr(rownames(exprSet), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db")
+entrezMatrix <- exprSet[IDs$SYMBOL,]
+rownames(entrezMatrix) <- IDs$ENTREZID
+
+# ssGSEA
+metaScore <- gsva(entrezMatrix, 
+                  geneList,
+                  method = "ssgsea",
+                  kcdf = "Gaussian",
+                  abs.ranking = T)  %>% t() %>% scale() %>% as.data.frame()
+
+colnames(metaScore) <- c("biosynthesis", "degradation")
+
+save(metaScore, file = "./RData/result_lipid_metabolism.RData")
+
+```
+
+# estimate TF activity
+
+```{r}
+# global options
+rm(list = ls())
+
+# load data
+load("./RData/result_GTEx_SAT.RData")
+
+# acessing human dorothea regulons
+data(dorothea_hs, package = "dorothea")
+
+regulons <- dorothea_hs %>%
+  filter(confidence %in% c("A", "B", "C", "D"))
+
+tfScore <- run_viper(exprSet,regulons,
+                     options = list(method = "scale",
+                                          minsize = 4,
+                                          eset.filter = FALSE,
+                                          cores = 1,
+                                          verbose = FALSE)) %>% t() %>% scale() %>% as.data.frame()
+
+save(tfScore, file = "./RData/result_TF_activity.RData")
+
+```
+
+# estimate immune cells infiltration
+
+```{r}
+# global options
+rm(list = ls())
+
+# load data
+load("./RData/result_GTEx_SAT.RData")
+
+# reverse log transformation
+expMatrix <- 2^exprSet
+
+write.table(expMatrix, file = "./RData/result_cibersort_file.txt", col.names = T, row.names = T, quote = F,sep = "\t")
+
+# call cibersort function
+source("./RScript/CIBERSORT.R")
+
+res.ciber <- CIBERSORT("./rawData/LM22.txt",
+                       "./RData/result_cibersort_file.txt",
+                       perm = 1000,
+                       QN  = F)
+
+# isolate cibersort scores
+immInfScore <- read.table("CIBERSORT-Results.txt",header = T,sep = '\t') %>%
+  dplyr::select(-c("P.value","Correlation","RMSE")) %>%
+  remove_rownames() %>%
+  column_to_rownames("Mixture")
+
+# filter cibersort scores
+keep <- apply(immInfScore, 2, function(x) sum(x == 0) < length(x)-20)
+
+immInfScore <- immInfScore[, which(keep)]
+
+save(immInfScore, file = "./RData/result_cibersort.RData")
+
+```
+
+# estimate immune cells activation
+
+```{r}
+# global options
+rm(list = ls())
+
+# load data
+load("./RData/result_GTEx_SAT.RData")
+
+# load gene list
+geneSet <- getGmt("./rawData/h.all.v7.3.symbols.gmt", geneIdType = SymbolIdentifier())
+
+geneSet.1 <- geneSet[c("HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+                       "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+                       "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+                       "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+                       "HALLMARK_IL2_STAT5_SIGNALING")]
+
+immActScore <- gsva(exprSet, 
+                    geneSet.1,
+                    method = "ssgsea",
+                    kcdf = "Gaussian",
+                    abs.ranking = T) %>% t() %>% scale() %>% as.data.frame()
+
+colnames(immActScore) <- gsub("HALLMARK_", "", colnames(immActScore))
+
+save(immActScore, file = "./RData/result_immActScore.RData")
+
+```
+
+# estimate thermogenesis
+
+```{r}
+# global options
+rm(list = ls())
+
+# load data
+load("./RData/result_GTEx_SAT.RData")
+
+# isolate KEGG term for ssGSEA
+buildGseaList <- function(species, selected) {
+  require(clusterProfiler)
+  require(tidyverse)
+  
+  keggList <- download_KEGG(species = species)
+  
+  keggRef <- keggList$KEGGPATHID2NAME %>% filter(to %in% selected)
+  
+  keggPath <- keggList$KEGGPATHID2EXTID %>% filter(from %in% keggRef$from)
+  
+  keggPath$from <- keggRef$to[match(keggPath$from, keggRef$from)]
+  
+  keggPath <- split(keggPath$to, keggPath$from)
+  
+  keggPath
+  
+}
+
+geneList <- buildGseaList(species = "hsa", 
+                          selected = c("Thermogenesis"))
+
+# rename gene names
+IDs <- bitr(rownames(exprSet), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db")
+entrezMatrix <- exprSet[IDs$SYMBOL,]
+rownames(entrezMatrix) <- IDs$ENTREZID
+
+# ssGSEA
+thermoScore <- gsva(entrezMatrix, 
+                  geneList,
+                  method = "ssgsea",
+                  kcdf = "Gaussian",
+                  abs.ranking = T)  %>% t() %>% scale() %>% as.data.frame()
+
+save(thermoScore, file = "./RData/result_thermoScore.RData")
+
+```
+
+# deep learning
+
+```{r}
+# global options
+rm(list = ls())
+
+# library
+library(keras)
+
+# load data
+load("./RData/result_GTEx_SAT.RData")
+
+dim(exprSet)
+cps <- fpm(dds)
+keep1 <- rowSums(cps >= 1) >= ceiling(ncol(dds)*1/3)
+exprSet <- exprSet[keep1, ]
+dim(exprSet)
+
+# unsupervised classification of SAT samples
+set.seed(2333)
+split_ind <- phenoData$group %>% caret::createDataPartition(p = 0.8,list = FALSE)
+
+dat <- exprSet %>% t() %>% scale()
+
+train_X <- dat[split_ind,] %>% as.matrix()
+test_X <- dat[-split_ind,] %>% as.matrix()
+
+input_layer <- layer_input(shape = c(ncol(dat))) 
+
+encoder <- 
+  input_layer %>% 
+  layer_dense(units = 1000, activation = "relu", kernel_regularizer = regularizer_l2(0.001)) %>% 
+  layer_batch_normalization() %>% 
+  layer_dropout(rate = 0.4) %>% 
+  layer_dense(units = 500, activation = "relu", kernel_regularizer = regularizer_l2(0.001)) %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 250, activation = "relu", kernel_regularizer = regularizer_l2(0.001)) %>%
+  layer_dense(units = 100)
+
+decoder <- 
+  encoder %>% 
+  layer_dense(units = 1000, activation = "relu", kernel_regularizer = regularizer_l2(0.001)) %>% 
+  layer_dropout(rate = 0.4) %>% 
+  layer_dense(units = 500, activation = "relu", kernel_regularizer = regularizer_l2(0.001)) %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 2500, activation = "relu", kernel_regularizer = regularizer_l2(0.001)) %>%
+  layer_dense(units = ncol(dat))
+
+autoencoder_model <- keras_model(inputs = input_layer, outputs = decoder)
+
+autoencoder_model %>% compile(loss='mean_squared_error', optimizer='adam', metrics = c('mae'))
+
+summary(autoencoder_model)
+
+history <- autoencoder_model %>%
+  keras::fit(train_X,
+             train_X,
+             epochs = 30,
+             shuffle = TRUE,
+             validation_data= list(test_X, test_X))
+
+plot(history)
+
+# save
+keras::save_model_weights_hdf5(object = autoencoder_model,
+                               filepath = './RData/result_autoencoder_weights_SAT.hdf5',
+                               overwrite = TRUE)
+
+encoder_model <- keras_model(inputs = input_layer, outputs = encoder)
+
+encoder_model %>% keras::load_model_weights_hdf5(filepath = './RData/result_autoencoder_weights_SAT.hdf5',skip_mismatch = TRUE,by_name = TRUE)
+
+encoder_model %>% compile(loss='mean_squared_error', optimizer='adam', metrics = c('mae'))
+
+feature <- encoder_model %>% keras::predict_on_batch(x = dat)
+rownames(feature) <- rownames(dat)
+colnames(feature) <- paste0("F", 1:100)
+save(feature , file = "./RData/result_GTEx_autoencoders.RData")
+
+```
+
+# isolate the DL feature as the indicator of human browning potential
+
+```{r}
+# global options
+rm(list = ls())
+
+# load data
+load("./RData/result_GTEx_autoencoders.RData")
+load("./RData/result_thermoScore.RData")
+
+feature <- feature[rownames(thermoScore),]
+
+dat <- cbind(feature, thermoScore)
+
+# APi score correlation
+cor.matrix <- cor(dat)
+cor.matrix <- cor.matrix[101, 1:100] %>% as.data.frame() %>% t() %>% magrittr::set_rownames("Thermogenesis")
+
+pCor <- pheatmap(cor.matrix, 
+         cluster_rows = F, cluster_cols = F,
+         show_colnames = F,
+         legend = T,
+         cellwidth = 3, cellheight = 40,
+         border_color = "black",
+         color = paletteer_c("ggthemes::Red-Gold", n = 50))
+
+pdf(file = "./plot/WAT_cor_heatmap.pdf", width = 6, height = 2)
+pCor
+dev.off()
+
+# feature 72 cor 0.7
+p <- dat[,c("F72", "Thermogenesis")] %>% 
+  ggplot(aes(x = F72, y = Thermogenesis))+
+  geom_point(color = "#c02c3866",size = 2)+
+  theme_classic()+
+  geom_smooth(method = 'lm', se = T, color = "#4f4032")+
+    stat_cor(method = "pearson")+
+  labs(x = "Feature 72", y = "Thermogenesis")+
+  theme(axis.line.x = element_line(size = 0.3),
+        axis.line.y = element_line(size = 0.3),
+        axis.ticks.x = element_line(size = 0.3),
+        axis.ticks.y = element_line(size = 0.3))
+
+pdf(file = "./plot/WAT_cor_dot.pdf", width = 3, height = 3)
+p
+dev.off()
+
+```
+
+# heatmap
+
+```{r}
+# global options
+rm(list = ls())
+
+# load data
+load("./RData/result_lipid_metabolism.RData")
+load("./RData/result_TF_activity.RData")
+load("./RData/result_GTEx_autoencoders.RData")
+
+relativeScore <- Reduce(cbind, list(metaScore, tfScore, feature)) %>% arrange(F72)
+
+# parameters for bar annotations
+barAnn <- HeatmapAnnotation(
+  foo = anno_barplot(relativeScore$F72,
+                    baseline = 0),
+  
+  annotation_label = "Feature 72",
+  annotation_name_side = "left",
+  annotation_name_gp = gpar(fontsize = 10, fontface = 'bold'),
+  
+  height = unit(1, "inches"))
+
+# parameters for column annotations
+colMeta <- relativeScore[,c(colnames(metaScore), 
+                            "PPARA", "PPARD", "PPARG")]
+
+color <- list(biosynthesis = colorRamp2(seq(-1, 1, length.out = 50), paletteer_c("ggthemes::Orange", n = 50)),
+              degradation = colorRamp2(seq(-1, 1, length.out = 50), paletteer_c("ggthemes::Orange", n = 50)),
+              PPARA = colorRamp2(seq(-1, 1, length.out = 50), paletteer_c("ggthemes::Purple", n = 50)),
+              PPARD = colorRamp2(seq(-1, 1, length.out = 50), paletteer_c("ggthemes::Purple", n = 50)),
+              PPARG = colorRamp2(seq(-1, 1, length.out = 50), paletteer_c("ggthemes::Purple", n = 50)))
+
+
+colAnn <- HeatmapAnnotation(
+  df = colMeta,
+  col = color,
+  annotation_legend_param = list(biosynthesis = list(direction = "horizontal", title = "FA biosynthesis"),
+                                 degradation = list(direction = "horizontal", title = "FA degradation"),
+                                 PPARA = list(direction = "horizontal", title = "PPARA activity"),
+                                 PPARD = list(direction = "horizontal", title = "PPARD activity"),
+                                 PPARG = list(direction = "horizontal", title = "PPARG activity")),
+  annotation_label = c("FA biosynthesis", "FA degradation", 
+                       "PPARA activity", "PPARD activity", "PPARG activity"),
+  annotation_name_side = "left",
+  annotation_name_gp = gpar(fontsize = 10),
+  gap = unit(2, "mm")
+)
+
+# create an empty matrix
+matrix <- data.frame(row.names = rownames(relativeScore), col = rep(0, nrow(relativeScore))) %>% t()
+
+p <- Heatmap(
+  matrix = matrix,
+  col = "white",
+  show_heatmap_legend = F,
+  heatmap_height = unit(2.5, "inches"),
+  heatmap_width = unit(6, "inches"),
+  
+  # row parameters
+  cluster_rows = F,
+  show_row_names = F,
+  row_title = NULL,
+  row_labels = NULL,
+  
+  # column (sample) parameters
+  cluster_columns = F,
+  show_column_names = F,
+  
+  # specify top and bottom annotations
+  top_annotation = barAnn,
+  bottom_annotation = colAnn
+)
+
+pdf(file = "./plot/WAT_heatmap.pdf", width = 8, height = 4)
+draw(p, heatmap_legend_side = "right", annotation_legend_side = 'bottom',)
+dev.off()
+
+```
+
+# immune cell infiltration
+
+```{r}
+# global options
+rm(list = ls())
+
+# load data
+load("./RData/result_cibersort.RData")
+load("./RData/result_GTEx_autoencoders.RData")
+
+feature <- as.data.frame(feature)
+immInfScore$Group <- ifelse(feature$F72 >= mean(feature$F72), "High", "Low")
+
+dat <- gather(immInfScore, Cell, Abundance, -Group)
+
+p <- ggplot(dat, aes(x = Abundance, y = Cell, fill = Group))+
+  geom_boxplot(size = 0.3, outlier.size = 0.3)+
+  scale_fill_manual(values = c("#DB802D", "#6163A3"))+
+  theme_classic()+
+  theme(axis.line.x = element_line(size = 0.3),
+        axis.line.y = element_line(size = 0.3),
+        axis.ticks.x = element_line(size = 0.3),
+        axis.ticks.y = element_line(size = 0.3),
+        legend.position = "bottom")+
+  labs(y = NULL)
+
+pdf(file = "./plot/WAT_cibersort.pdf", width = 3.5, height = 6)
+p
+dev.off()
+
+```
+
+# inflammation
+
+```{r}
+# global options
+rm(list = ls())
+
+# load data
+load("./RData/result_immActScore.RData")
+load("./RData/result_GTEx_autoencoders.RData")
+
+dat <- cbind(feature, immActScore)
+
+p1 <- ggplot(dat, aes(x = F72, y = TNFA_SIGNALING_VIA_NFKB))+
+  geom_point(color = "#DB802D66", size = 0.5)+
+  theme_classic()+
+  geom_smooth(method = 'lm', se = F, color = "#6163A3")+
+  stat_cor(method = "pearson", label.x = -5.5)+
+  labs(x = "Feature 72", y = "TNFa signaling")+
+  theme(axis.line.x = element_line(size = 0.3),
+        axis.line.y = element_line(size = 0.3),
+        axis.ticks.x = element_line(size = 0.3),
+        axis.ticks.y = element_line(size = 0.3))
+
+p2 <- ggplot(dat, aes(x = F72, y = INTERFERON_ALPHA_RESPONSE))+
+  geom_point(color = "#DB802D66", size = 0.5)+
+  theme_classic()+
+  geom_smooth(method = 'lm', se = F, color = "#6163A3")+
+  stat_cor(method = "pearson", label.x = -5.5)+
+  labs(x = "Feature 72", y = "IFNa response")+
+  theme(axis.line.x = element_line(size = 0.3),
+        axis.line.y = element_line(size = 0.3),
+        axis.ticks.x = element_line(size = 0.3),
+        axis.ticks.y = element_line(size = 0.3))
+
+p3 <- ggplot(dat, aes(x = F72, y = INTERFERON_GAMMA_RESPONSE))+
+  geom_point(color = "#DB802D66", size = 0.5)+
+  theme_classic()+
+  geom_smooth(method = 'lm', se = F, color = "#6163A3")+
+  stat_cor(method = "pearson", label.x = -5.5)+
+  labs(x = "Feature 72", y = "IFNg response")+
+  theme(axis.line.x = element_line(size = 0.3),
+        axis.line.y = element_line(size = 0.3),
+        axis.ticks.x = element_line(size = 0.3),
+        axis.ticks.y = element_line(size = 0.3))
+
+pdf(file = "./plot/WAT_inflam.pdf", width = 2.5, height = 5)
+p1+p2+p3+plot_layout(ncol = 1)
+dev.off()
+
+```
+
+# cor
+
+```{r}
+# global options
+rm(list = ls())
+
+# load data
+load("./RData/result_GTEx_SAT.RData")
+load("./RData/result_GTEx_autoencoders.RData")
+
+# isolate data
+dat <- cbind(feature, t(exprSet[c("OASL", "UCP1", "IL1B", "FAR2", "SORL1", "CD96", "STX11", "REEP6", "DHRS11", "BANK1"),]))
+
+
+pCor <- function(dat, gene){
+  require(ggpubr)
+  dat <- dat[,c("F72", gene)] %>% as.data.frame() %>% magrittr::set_colnames(c("F72", "geneE")) 
+  ggplot(dat, aes(x = F72, y = geneE))+
+    geom_hex(bins = 15)+
+    #geom_point(color = "#6163A366")+
+    #scale_fill_viridis_c(option = "A",direction = -1)+
+    scale_fill_gradient(low = "#6163A366", high = "#6163A3")+
+    theme_classic()+
+    geom_smooth(method = 'lm', se = F, color = "#DB802D")+
+    stat_cor(method = "pearson")+
+    labs(x = "Feature 72", y = paste(gene, "expression", sep = " "))+
+    theme(axis.line.x = element_line(size = 0.3),
+        axis.line.y = element_line(size = 0.3),
+        axis.ticks.x = element_line(size = 0.3),
+        axis.ticks.y = element_line(size = 0.3))
+}
+
+p1 <- pCor(dat, gene = "BANK1")
+p2 <- pCor(dat, gene = "DHRS11")
+p3 <- pCor(dat, gene = "REEP6")
+p4 <- pCor(dat, gene = "STX11")
+
+p5 <- pCor(dat, gene = "OASL")
+p6 <- pCor(dat, gene = "UCP1")
+p7 <- pCor(dat, gene = "IL1B")
+p8 <- pCor(dat, gene = "FAR2")
+p9 <- pCor(dat, gene = "SORL1")
+p10 <- pCor(dat, gene = "CD96")
+
+
+pdf(file = "./plot/WAT_cor1.pdf", width = 13, height = 3)
+p1+p2+p3+p4+plot_layout(nrow = 1)
+dev.off()
+
+pdf(file = "./plot/WAT_cor2.pdf", width = 12, height = 6)
+p5+p6+p7+p8+p9+p10+plot_layout(nrow = 2)
+dev.off()
+
+```
+
+# ML model selection
+
+```{r predict}
+# global options
+rm(list = ls())
+
+# load data
+load("./RData/result_GTEx_SAT.RData")
+load("./RData/result_GTEx_autoencoders.RData")
+
+# data prepare
+meanNor <- function(x){(x-mean(x))/(max(x)-min(x))}
+
+matrix <- exprSet[c("DHRS11", "REEP6", "STX11"),] %>% t()
+dat <- cbind(feature, matrix)
+dat <- subset(dat, select = c("F72", "DHRS11", "REEP6", "STX11")) %>% apply(2, meanNor) %>% as.data.frame()
+dat <- arrange(dat, F72)
+
+# create data partition
+set.seed(123)
+index <- createDataPartition(dat$F72, times = 1, p = 0.7, list = F) 
+
+dat.train <- dat[index,]
+dim(dat.train)
+dat.test <- dat[-index,]
+dim(dat.test)
+
+# train the algorithms
+control <- trainControl(method = "cv", 
+                        number = 10,
+                        index = createResample(dat.train$F72, 10),
+                        savePredictions = "final",
+                        classProbs = FALSE)
+
+set.seed(2222)
+models <- caretList(
+  F72 ~ ., 
+  data = dat.train,
+  trControl = control,
+  metric = "Rsquared",
+  methodList = c("enet", "rf", "neuralnet", "brnn")
+)
+
+modelss <- models
+
+# model selection
+modelss$enet <- NULL
+
+stack <- caretStack(modelss, 
+                    method = "glm",
+                    metric = "Rsquared",
+                    trControl=trainControl(method="cv",
+                                           number=10,
+                                           index = createResample(dat.train$F72, 10),
+                                           savePredictions = "final",
+                                           classProbs = FALSE))
+
+
+summary(stack)
+
+models$ensemble <- stack
+
+save(models, file = "./RData/result_models.RData")
+
+# validation of the trained models in testing set
+model_preds <- lapply(models, predict, newdata = dat.test, interval = "prediction",level = 0.95) %>%
+  lapply(function(x) postResample(pred = x, obs = dat.test$F72)[2]) %>% 
+  as.data.frame() %>%
+  t() %>%
+  magrittr::set_colnames("R2") %>%
+  as.data.frame() %>%
+  rownames_to_column("method")
+
+model_preds$method <- factor(model_preds$method, levels = model_preds$method)
+
+
+p <- ggplot(model_preds, aes(x = method,y = R2, fill = R2))+
+  geom_bar(stat="identity")+
+  geom_text(aes(label = round(R2, digits = 4), vjust = -0.8, hjust = 0.5))+
+  scale_fill_paletteer_c("viridis::viridis")+
+  ylim(0,0.8)+
+  theme_classic()+
+  labs(x = NULL, y = expression(Performance (R^2)))+
+  theme(axis.line.x = element_line(size = 0.3),
+        axis.line.y = element_line(size = 0.3),
+        axis.ticks.x = element_line(size = 0.3),
+        axis.ticks.y = element_line(size = 0.3),
+        legend.position="none")
+
+pdf(file = "./plot/method_performance.pdf", width = 7, height = 3)
+p
+dev.off()
+
+# save the predictions for further analysis
+fit <- models[[5]]
+res.pre <- predict(fit, dat.train, interval = "prediction",level = 0.95) %>% as.data.frame() %>% magrittr::set_colnames("fit")
+res.pre$F72 <- dat.train$F72
+
+res.val <- predict(fit, dat.test, interval = "prediction",level = 0.95) %>% as.data.frame() %>% magrittr::set_colnames("fit")
+res.val$F72 <- dat.test$F72
+
+save(res.pre, res.val, file = "./RData/result_validation_WAT.RData")
+
+```
+
+# validate the models in adipocyte dataset
+
+```{r}
+# global options
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+# load data
+load("./RData/result_BC3_GSE71293.RData")
+load("./RData/result_models.RData")
+
+# predict
+meanNor <- function(x){(x-mean(x))/(max(x)-min(x))}
+
+test <- res_BC3_GSE71293$expMatrix %>% t() %>% apply(2, meanNor)  %>% as.data.frame()
+
+res <- lapply(models[1:4], predict, newdata = test, interval = "prediction",level = 0.95)
+
+res <- lapply(res, cbind, res_BC3_GSE71293$phenoData) %>% lapply(remove_rownames)
+
+for (i in 1:length(res)) {
+  res[[i]] <- add_column(res[[i]], method = names(res[i]));rm(i)
+}
+
+res <- Reduce(rbind, res)
+
+colnames(res)[1] <- "fit"
+
+res$method <- factor(res$method, levels = unique(res$method))
+res$Group <- factor(res$group, levels = c("White", "Beige"))
+
+p <- ggplot(res, aes(x = method, y = fit, fill = Group))+
+  geom_boxplot()+
+  theme_classic()+
+  labs(x = NULL, y = "Prediction")+
+  ggtitle("Cell cohort (BC3)")+
+  scale_fill_manual(values = c("#559575", "#6163A3"))+
+  stat_compare_means(aes(label = paste0("p = ", ..p.format..)), 
+                     method = "t.test",  
+                     method.args = list(p.adjust.method = "BH"))+
+  theme(axis.line.x = element_line(size = 0.3),
+        axis.line.y = element_line(size = 0.3),
+        axis.ticks.x = element_line(size = 0.3),
+        axis.ticks.y = element_line(size = 0.3),
+        plot.title = element_text(hjust = 0.5))
+
+pdf(file = "./plot/method_selection1.pdf", width = 7, height = 3)
+p
+dev.off()
+
+```
+
+# validate the models in adipose tissue dataset
+
+```{r}
+# global options
+rm(list = ls())
+
+# load data
+load("./RData/result_BT2_GSE122721.RData")
+load("./RData/result_models.RData")
+
+# predict
+meanNor <- function(x){(x-mean(x))/(max(x)-min(x))}
+
+test <- res_BT2_GSE122721$expMatrix %>% t() %>% apply(2, meanNor)  %>% as.data.frame()
+
+res <- lapply(models[1:4], predict, newdata = test, interval = "prediction",level = 0.95)
+
+res <- lapply(res, cbind, res_BT2_GSE122721$phenoData) %>% lapply(remove_rownames)
+
+for (i in 1:length(res)) {
+  res[[i]] <- add_column(res[[i]], method = names(res[i]));rm(i)
+}
+
+res <- Reduce(rbind, res)
+
+colnames(res)[1] <- "fit"
+
+res$method <- factor(res$method, levels = unique(res$method))
+res$Group <- factor(res$group, levels = c("WAT", "BAT"))
+
+p <- ggplot(res, aes(x = method, y = fit, fill = Group))+
+  geom_boxplot()+
+  theme_classic()+
+  labs(x = NULL, y = "Prediction")+
+  ggtitle("Tissue cohort (BT2)")+
+  scale_fill_manual(values = c("#559575", "#6163A3"))+
+  stat_compare_means(aes(label = paste0("p = ", ..p.format..)), 
+                     method = "t.test",  
+                     method.args = list(p.adjust.method = "BH"))+
+  theme(axis.line.x = element_line(size = 0.3),
+        axis.line.y = element_line(size = 0.3),
+        axis.ticks.x = element_line(size = 0.3),
+        axis.ticks.y = element_line(size = 0.3),
+        plot.title = element_text(hjust = 0.5))
+
+pdf(file = "./plot/method_selection2.pdf", width = 7, height = 3)
+p
+dev.off()
+
+```
+
+# final decision
+
+```{r}
+# global options
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+# load data
+load("./RData/result_models.RData")
+
+fit <- models[[5]]
+
+save(fit, file = "./RData/result_score.RData")
+
+summary(fit)
+
+```
