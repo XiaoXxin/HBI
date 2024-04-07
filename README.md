@@ -13,7 +13,7 @@ source("HBI.R")
 
 -------
 If you use HBI or absHBI in published research, please cite:
-
+Wang, Y., Zuo, S., Yang, N. et al. Deep learning enables the quantification of browning capacity of human adipose samples. J Big Data 11, 29 (2024). https://doi.org/10.1186/s40537-024-00879-9
 
 
 
